@@ -401,3 +401,153 @@ cuBLAS hgemm : 0.0262 ms, 82048.2 GFLOPS
 仅仅增加 block 内 warp 数并不会自动提升 WMMA GEMM 性能；
 multi-warp WMMA 需要结合 shared memory staging 才能产生明显复用收益。
 
+
+---
+
+## WMMA Shared Memory Staging 与 Bank Conflict 优化
+
+在 minimal WMMA 和 multi-warp WMMA 的基础上，本项目进一步实现了 shared memory staging 版本，用于分析 Tensor Core GEMM 中 block-level 数据复用和 shared memory layout 对性能的影响。
+
+### 1. Shared Memory Staging 设计
+
+16-warp shared WMMA kernel 的设计如下：
+
+```text
+一个 block = 16 warps = 512 threads
+一个 block 计算 64 x 64 C tile
+每个 warp 计算一个 16 x 16 C tile
+
+A shared tile: 64 x 16
+B shared tile: 16 x 64
+
+计算路径从 direct WMMA 的：
+
+global memory -> WMMA fragment -> Tensor Core
+
+变为：
+
+global memory -> shared memory -> WMMA fragment -> Tensor Core
+
+理论上，这可以让一个 block 内的多个 warp 复用 A/B tile，减少重复 global memory load。
+
+2. 初始 Shared 版本性能问题
+
+初始 16-warp shared WMMA 版本虽然增加了 shared memory staging，但性能仍低于 direct WMMA。在 NVIDIA A40 上，2048 x 2048 x 2048 的结果为：
+
+wmma minimal        : ~16.6 TFLOPS
+wmma 16warp shared : ~12.1 TFLOPS
+cuBLAS hgemm        : ~77.4 TFLOPS
+
+这说明 shared memory staging 并不是无脑加速。若 shared memory layout 不合理，额外的 shared memory 读写、同步和 bank conflict 可能会抵消 global memory 复用收益。
+
+3. Nsight Compute Bank Conflict 分析
+
+使用 Nsight Compute 分析 wmma_gemm16warp_shared_kernel 后，发现 shared load 存在严重 bank conflict。
+
+无 padding 版本中：
+
+shared load bank conflicts: 131072
+excessive wavefronts: 131072
+conflict ratio: about 80% of shared-load wavefronts
+
+这说明普通 row-major shared memory layout 不适合当前 WMMA load_matrix_sync 的 shared memory 访问模式。
+
+4. Shared Memory Padding 优化
+
+为缓解 bank conflict，对 shared memory 的 leading dimension 增加 padding。
+
+原始 layout：
+
+__shared__ half AS[64][16];
+__shared__ half BS[16][64];
+
+padding 后：
+
+#ifndef WM64_PAD_A
+#define WM64_PAD_A 8
+#endif
+
+#ifndef WM64_PAD_B
+#define WM64_PAD_B 8
+#endif
+
+#define WM64_AS_LD (WMMA_K + WM64_PAD_A)
+#define WM64_BS_LD (WM64_BLOCK_N + WM64_PAD_B)
+
+__shared__ half AS[64][WM64_AS_LD];  // 64 x 24
+__shared__ half BS[16][WM64_BS_LD];  // 16 x 72
+
+对应的 WMMA shared load 也需要使用 padding 后的 leading dimension：
+
+wmma::load_matrix_sync(a_frag, a_tile, WM64_AS_LD);
+wmma::load_matrix_sync(b_frag, b_tile, WM64_BS_LD);
+
+需要注意，half 类型的 WMMA load_matrix_sync 对 leading dimension 有对齐要求：
+
+WM64_AS_LD % 8 == 0
+WM64_BS_LD % 8 == 0
+
+否则可能触发 misaligned address。
+
+5. Padding Sweep
+
+测试了多组 padding 配置：
+
+Padding	1024³ GFLOPS	2048³ GFLOPS	结论
+no padding	~8918	~12076	bank conflict 严重
+A=8, B=0	~9174	~12480	提升较小
+A=0, B=8	~11292	~14986	提升明显
+A=0, B=16	~10960	~14646	不如 B=8
+A=0, B=24	~11248	~14992	接近 B=8
+A=8, B=16	~11415	~15123	有提升
+A=8, B=8	~11708	~15491	当前最佳
+A=16, B=8	~10509	~14097	变差
+
+实验显示，B tile 的 padding 收益更加明显，说明当前 bank conflict 主要来自 BS 的 shared memory load pattern。最终选择 PAD_A=8, PAD_B=8 作为默认配置。
+
+6. Padding 后的 Nsight Compute 结果
+
+采用 PAD_A=8, PAD_B=8 后，Nsight Compute 显示：
+
+shared load bank conflicts: 16384
+excessive wavefronts: 16384
+
+相比无 padding 版本：
+
+131072 -> 16384
+
+shared load bank conflicts 下降约 8 倍。
+
+7. 性能收益
+
+在 NVIDIA A40 上，2048 x 2048 x 2048 HGEMM 的结果为：
+
+wmma 16warp shared  : ~12076 GFLOPS
+wmma 16warp padding : ~15491 GFLOPS
+wmma minimal        : ~16617 GFLOPS
+cuBLAS hgemm        : ~77357 GFLOPS
+
+padding 后，16-warp shared WMMA 的性能相比无 padding 版本提升约：
+
+15491 / 12076 ≈ 1.28x
+
+这说明 shared memory padding 能显著缓解 bank conflict，并提升 WMMA shared staging 的实际性能。
+
+8. 总结
+
+这个实验说明：
+
+shared memory staging 不是无脑加速；
+multi-warp WMMA 需要合理的 shared memory layout；
+普通 row-major shared layout 会导致严重 bank conflict；
+padding shared memory leading dimension 可以显著降低 bank conflict；
+当前 padding 版本已经接近 direct WMMA，但距离 cuBLAS 仍有较大差距。
+
+后续优化方向包括：
+
+shared memory swizzle layout
+vectorized global -> shared load
+double buffering / pipeline
+cp.async
+更复杂的 block-level / warp-level tiling
+

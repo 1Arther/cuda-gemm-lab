@@ -140,6 +140,260 @@ __global__ void wmma_gemm4warp_kernel(
     float* c_tile = C + row * N + col;
     wmma::store_matrix_sync(c_tile, c_frag, N, wmma::mem_row_major);
 }
+
+// ============================================================
+// 4-warp WMMA GEMM with shared memory staging
+//
+// 一个 block = 4 warps = 128 threads
+// 一个 block 计算 32 x 32 C tile
+// 每个 warp 计算一个 16 x 16 C tile
+//
+// global memory -> shared memory -> WMMA fragment -> Tensor Core
+// ============================================================
+__global__ void wmma_gemm4warp_shared_kernel(
+    const half* A,
+    const half* B,
+    float* C,
+    int M,
+    int N,
+    int K
+) {
+    int tid = threadIdx.x;
+    int warpId = tid / warpSize;
+
+    if (warpId >= WM_BLOCK_WARP) {
+        return;
+    }
+
+    int tile_col = blockIdx.x;
+    int tile_row = blockIdx.y;
+
+    int block_row = tile_row * WM_BLOCK_M;
+    int block_col = tile_col * WM_BLOCK_N;
+
+    int warp_m = warpId / WM_WARP_N;
+    int warp_n = warpId % WM_WARP_N;
+
+    int row = block_row + warp_m * WMMA_M;
+    int col = block_col + warp_n * WMMA_N;
+
+    __shared__ half AS[WM_BLOCK_M][WMMA_K];
+    __shared__ half BS[WMMA_K][WM_BLOCK_N];
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += WMMA_K) {
+        for (int id = threadIdx.x; id < WM_BLOCK_M * WMMA_K; id += blockDim.x) {
+            int smem_row = id / WMMA_K;
+            int smem_col = id % WMMA_K;
+
+            AS[smem_row][smem_col] =
+                A[(block_row + smem_row) * K + (k0 + smem_col)];
+        }
+
+        for (int id = threadIdx.x; id < WMMA_K * WM_BLOCK_N; id += blockDim.x) {
+            int smem_row = id / WM_BLOCK_N;
+            int smem_col = id % WM_BLOCK_N;
+
+            BS[smem_row][smem_col] =
+                B[(k0 + smem_row) * N + (block_col + smem_col)];
+        }
+
+        __syncthreads();
+
+        const half* a_tile = &AS[warp_m * WMMA_M][0];
+        const half* b_tile = &BS[0][warp_n * WMMA_N];
+
+        wmma::load_matrix_sync(a_frag, a_tile, WMMA_K);
+        wmma::load_matrix_sync(b_frag, b_tile, WM_BLOCK_N);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    float* c_tile = C + row * N + col;
+    wmma::store_matrix_sync(c_tile, c_frag, N, wmma::mem_row_major);
+}
+
+// ============================================================
+// 16-warp WMMA GEMM with shared memory staging
+//
+// 一个 block = 16 warps = 512 threads
+// 一个 block 计算 64 x 64 C tile
+// 每个 warp 计算一个 16 x 16 C tile
+//
+// global memory -> shared memory -> WMMA fragment -> Tensor Core
+// ============================================================
+#define WM64_WARP_M 4
+#define WM64_WARP_N 4
+#define WM64_BLOCK_WARP 16
+
+#define WM64_BLOCK_M (WM64_WARP_M * WMMA_M)  // 64
+#define WM64_BLOCK_N (WM64_WARP_N * WMMA_N)  // 64
+
+__global__ void wmma_gemm16warp_shared_kernel(
+    const half* A,
+    const half* B,
+    float* C,
+    int M,
+    int N,
+    int K
+) {
+    int tid = threadIdx.x;
+    int warpId = tid / warpSize;  // 0 ~ 15
+
+    int tile_col = blockIdx.x;
+    int tile_row = blockIdx.y;
+
+    int block_row = tile_row * WM64_BLOCK_M;
+    int block_col = tile_col * WM64_BLOCK_N;
+
+    int warp_m = warpId / WM64_WARP_N;  // 0 ~ 3
+    int warp_n = warpId % WM64_WARP_N;  // 0 ~ 3
+
+    int row = block_row + warp_m * WMMA_M;
+    int col = block_col + warp_n * WMMA_N;
+
+    __shared__ half AS[WM64_BLOCK_M][WMMA_K];   // 64 x 16
+    __shared__ half BS[WMMA_K][WM64_BLOCK_N];   // 16 x 64
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += WMMA_K) {
+        // load A block tile: 64 x 16
+        for (int id = tid; id < WM64_BLOCK_M * WMMA_K; id += blockDim.x) {
+            int smem_row = id / WMMA_K;
+            int smem_col = id % WMMA_K;
+
+            AS[smem_row][smem_col] =
+                A[(block_row + smem_row) * K + (k0 + smem_col)];
+        }
+
+        // load B block tile: 16 x 64
+        for (int id = tid; id < WMMA_K * WM64_BLOCK_N; id += blockDim.x) {
+            int smem_row = id / WM64_BLOCK_N;
+            int smem_col = id % WM64_BLOCK_N;
+
+            BS[smem_row][smem_col] =
+                B[(k0 + smem_row) * N + (block_col + smem_col)];
+        }
+
+        __syncthreads();
+
+        // each warp loads its own 16 x 16 A/B fragment from shared memory
+        const half* a_tile = &AS[warp_m * WMMA_M][0];
+        const half* b_tile = &BS[0][warp_n * WMMA_N];
+
+        // AS row stride = 16
+        // BS row stride = 64
+        wmma::load_matrix_sync(a_frag, a_tile, WMMA_K);
+        wmma::load_matrix_sync(b_frag, b_tile, WM64_BLOCK_N);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    float* c_tile = C + row * N + col;
+    wmma::store_matrix_sync(c_tile, c_frag, N, wmma::mem_row_major);
+}
+
+#ifndef WM64_PAD_A
+#define WM64_PAD_A 8
+#endif
+
+#ifndef WM64_PAD_B
+#define WM64_PAD_B 8
+#endif
+
+#define WM64_WARP_M 4
+#define WM64_WARP_N 4
+#define WM64_BLOCK_WARP 16
+
+#define WM64_BLOCK_M (WM64_WARP_M * WMMA_M)
+#define WM64_BLOCK_N (WM64_WARP_N * WMMA_N)
+
+#define WM64_AS_LD (WMMA_K + WM64_PAD_A)
+#define WM64_BS_LD (WM64_BLOCK_N + WM64_PAD_B)
+
+__global__ void wmma_gemm16warp_shared_padding_kernel(
+    const half* A,
+    const half* B,
+    float* C,
+    int M,
+    int N,
+    int K
+) {
+    int tid = threadIdx.x;
+    int warpId = tid / warpSize;  // 0 ~ 15
+
+    int tile_col = blockIdx.x;
+    int tile_row = blockIdx.y;
+
+    int block_row = tile_row * WM64_BLOCK_M;
+    int block_col = tile_col * WM64_BLOCK_N;
+
+    int warp_m = warpId / WM64_WARP_N;
+    int warp_n = warpId % WM64_WARP_N;
+
+    int row = block_row + warp_m * WMMA_M;
+    int col = block_col + warp_n * WMMA_N;
+
+    __shared__ half AS[WM64_BLOCK_M][WM64_AS_LD];
+    __shared__ half BS[WMMA_K][WM64_BS_LD];
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += WMMA_K) {
+        // load A: logical tile is 64 x 16
+        for (int id = tid; id < WM64_BLOCK_M * WMMA_K; id += blockDim.x) {
+            int smem_row = id / WMMA_K;
+            int smem_col = id % WMMA_K;
+
+            AS[smem_row][smem_col] =
+                A[(block_row + smem_row) * K + (k0 + smem_col)];
+        }
+
+        // load B: logical tile is 16 x 64
+        for (int id = tid; id < WMMA_K * WM64_BLOCK_N; id += blockDim.x) {
+            int smem_row = id / WM64_BLOCK_N;
+            int smem_col = id % WM64_BLOCK_N;
+
+            BS[smem_row][smem_col] =
+                B[(k0 + smem_row) * N + (block_col + smem_col)];
+        }
+
+        __syncthreads();
+
+        const half* a_tile = &AS[warp_m * WMMA_M][0];
+        const half* b_tile = &BS[0][warp_n * WMMA_N];
+
+        // 注意：这里 ldm 要用 padding 后的 shared memory stride
+        wmma::load_matrix_sync(a_frag, a_tile, WM64_AS_LD);
+        wmma::load_matrix_sync(b_frag, b_tile, WM64_BS_LD);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    float* c_tile = C + row * N + col;
+    wmma::store_matrix_sync(c_tile, c_frag, N, wmma::mem_row_major);
+}
+
 // ============================================================
 // CPU reference
 // A/B: half
@@ -286,6 +540,132 @@ float benchmark_wmma4warp(
 
     return ms / repeat;
 }
+float benchmark_wmma4warp_shared(
+    const half* d_A,
+    const half* d_B,
+    float* d_C,
+    int M,
+    int N,
+    int K,
+    int warmup,
+    int repeat
+) {
+    dim3 block(32 * WM_BLOCK_WARP);  // 4 warps = 128 threads
+    dim3 grid(N / WM_BLOCK_N, M / WM_BLOCK_M);
+
+    for (int i = 0; i < warmup; i++) {
+        wmma_gemm4warp_shared_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+
+    for (int i = 0; i < repeat; i++) {
+        wmma_gemm4warp_shared_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return ms / repeat;
+}
+
+float benchmark_wmma16warp_shared(
+    const half* d_A,
+    const half* d_B,
+    float* d_C,
+    int M,
+    int N,
+    int K,
+    int warmup,
+    int repeat
+) {
+    dim3 block(32 * WM64_BLOCK_WARP);  // 16 warps = 512 threads
+    dim3 grid(N / WM64_BLOCK_N, M / WM64_BLOCK_M);
+
+    for (int i = 0; i < warmup; i++) {
+        wmma_gemm16warp_shared_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+
+    for (int i = 0; i < repeat; i++) {
+        wmma_gemm16warp_shared_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return ms / repeat;
+}
+
+float benchmark_wmma16warp_shared_padding(
+    const half* d_A,
+    const half* d_B,
+    float* d_C,
+    int M,
+    int N,
+    int K,
+    int warmup,
+    int repeat
+) {
+    dim3 block(32 * WM64_BLOCK_WARP);  // 16 warps = 512 threads
+    dim3 grid(N / WM64_BLOCK_N, M / WM64_BLOCK_M);
+
+    for (int i = 0; i < warmup; i++) {
+        wmma_gemm16warp_shared_padding_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+
+    for (int i = 0; i < repeat; i++) {
+        wmma_gemm16warp_shared_padding_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return ms / repeat;
+}
+
 // ============================================================
 // cuBLAS FP16 input + FP32 accumulation baseline
 //
@@ -388,6 +768,9 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
     std::vector<float> h_C_ref(size_C, 0.0f);
     std::vector<float> h_C_wmma(size_C, 0.0f);
     std::vector<float> h_C_wmma4warp(size_C, 0.0f);
+    std::vector<float> h_C_wmma4warp_shared(size_C, 0.0f);
+    std::vector<float> h_C_wmma16warp_shared(size_C, 0.0f);
+    std::vector<float> h_C_wmma16warp_padding(size_C, 0.0f);
     std::vector<float> h_C_cublas(size_C, 0.0f);
 
     init_random_half(h_A, 123);
@@ -421,6 +804,15 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
     float ms_wmma4warp = benchmark_wmma4warp(d_A, d_B, d_C, M, N, K, warmup, repeat);
     CHECK_CUDA(cudaMemcpy(h_C_wmma4warp.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
 
+    float ms_wmma4warp_shared = benchmark_wmma4warp_shared(d_A, d_B, d_C, M, N, K, warmup, repeat);
+    CHECK_CUDA(cudaMemcpy(h_C_wmma4warp_shared.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
+
+    float ms_wmma16warp_shared = benchmark_wmma16warp_shared(d_A, d_B, d_C, M, N, K, warmup, repeat);
+    CHECK_CUDA(cudaMemcpy(h_C_wmma16warp_shared.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
+
+    float ms_wmma16warp_padding = benchmark_wmma16warp_shared_padding(d_A, d_B, d_C, M, N, K, warmup, repeat);
+    CHECK_CUDA(cudaMemcpy(h_C_wmma16warp_padding.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
+
     float ms_cublas = benchmark_cublas(handle, d_A, d_B, d_C, M, N, K, warmup, repeat);
     CHECK_CUDA(cudaMemcpy(h_C_cublas.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -432,6 +824,18 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
 
     std::cout << "wmma 4warp   : " << ms_wmma4warp
               << " ms, " << calc_gflops(M, N, K, ms_wmma4warp)
+              << " GFLOPS" << std::endl;
+
+    std::cout << "wmma 4warp shared : " << ms_wmma4warp_shared
+              << " ms, " << calc_gflops(M, N, K, ms_wmma4warp_shared)
+              << " GFLOPS" << std::endl;
+
+    std::cout << "wmma 16warp shared: " << ms_wmma16warp_shared
+              << " ms, " << calc_gflops(M, N, K, ms_wmma16warp_shared)
+              << " GFLOPS" << std::endl;
+
+    std::cout << "wmma 16warp padding: " << ms_wmma16warp_padding
+              << " ms, " << calc_gflops(M, N, K, ms_wmma16warp_padding)
               << " GFLOPS" << std::endl;
 
     std::cout << "cuBLAS hgemm : " << ms_cublas
@@ -446,6 +850,29 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
         float max_err_wmma4warp = 0.0f;
         double mean_err_wmma4warp = 0.0;
         calc_error(h_C_ref, h_C_wmma4warp, max_err_wmma4warp, mean_err_wmma4warp);
+        
+        float max_err_wmma4warp_shared = 0.0f;
+        double mean_err_wmma4warp_shared = 0.0;
+        calc_error(h_C_ref, h_C_wmma4warp_shared, max_err_wmma4warp_shared, mean_err_wmma4warp_shared);
+
+        float max_err_wmma16warp_shared = 0.0f;
+        double mean_err_wmma16warp_shared = 0.0;
+        calc_error(
+            h_C_ref,
+            h_C_wmma16warp_shared,
+            max_err_wmma16warp_shared,
+            mean_err_wmma16warp_shared
+        );
+
+        float max_err_wmma16warp_padding = 0.0f;
+        double mean_err_wmma16warp_padding = 0.0;
+
+        calc_error(
+            h_C_ref,
+            h_C_wmma16warp_padding,
+            max_err_wmma16warp_padding,
+            mean_err_wmma16warp_padding
+        );
 
         float max_err_cublas = 0.0f;
         double mean_err_cublas = 0.0;
@@ -456,6 +883,20 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
 
         std::cout << "max error wmma4warp : " << max_err_wmma4warp << std::endl;
         std::cout << "mean error wmma4warp: " << mean_err_wmma4warp << std::endl;
+
+        std::cout << "max error wmma4warp shared : " << max_err_wmma4warp_shared << std::endl;
+        std::cout << "mean error wmma4warp shared: " << mean_err_wmma4warp_shared << std::endl;
+
+        std::cout << "max error wmma16warp shared : "
+          << max_err_wmma16warp_shared << std::endl;
+
+        std::cout << "mean error wmma16warp shared: "
+          << mean_err_wmma16warp_shared << std::endl;
+        
+        std::cout << "max error wmma16warp padding : "
+          << max_err_wmma16warp_padding << std::endl;
+        std::cout << "mean error wmma16warp padding: "
+          << mean_err_wmma16warp_padding << std::endl;
 
         std::cout << "max error cuBLAS    : " << max_err_cublas << std::endl;
         std::cout << "mean error cuBLAS   : " << mean_err_cublas << std::endl;

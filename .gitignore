@@ -27,3 +27,13 @@ benchmark_*.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# benchmark outputs
+*.txt
+*.ncu-rep
+
+# local binaries / temporary files
+gemm_lab
+wmma_lab
+main.cu
+build/
