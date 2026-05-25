@@ -81,6 +81,66 @@ __global__ void wmma_gemm_kernel(
 }
 
 // ============================================================
+// 4-warp WMMA GEMM
+//
+// 一个 block = 4 warps = 128 threads
+// 一个 block 计算 32 x 32 C tile
+// 每个 warp 计算一个 16 x 16 C tile
+// ============================================================
+#define WM_WARP_M 2
+#define WM_WARP_N 2
+#define WM_BLOCK_WARP 4
+
+#define WM_BLOCK_M (WM_WARP_M * WMMA_M)  // 32
+#define WM_BLOCK_N (WM_WARP_N * WMMA_N)  // 32
+
+__global__ void wmma_gemm4warp_kernel(
+    const half* A,
+    const half* B,
+    float* C,
+    int M,
+    int N,
+    int K
+) {
+    int tid = threadIdx.x;
+    int warpId = tid / warpSize;
+
+    if (warpId >= WM_BLOCK_WARP) {
+        return;
+    }
+
+    int tile_col = blockIdx.x;
+    int tile_row = blockIdx.y;
+
+    int block_row = tile_row * WM_BLOCK_M;
+    int block_col = tile_col * WM_BLOCK_N;
+
+    int warp_m = warpId / WM_WARP_N;
+    int warp_n = warpId % WM_WARP_N;
+
+    int row = block_row + warp_m * WMMA_M;
+    int col = block_col + warp_n * WMMA_N;
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += WMMA_K) {
+        const half* a_tile = A + row * K + k0;
+        const half* b_tile = B + k0 * N + col;
+
+        wmma::load_matrix_sync(a_frag, a_tile, K);
+        wmma::load_matrix_sync(b_frag, b_tile, N);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    float* c_tile = C + row * N + col;
+    wmma::store_matrix_sync(c_tile, c_frag, N, wmma::mem_row_major);
+}
+// ============================================================
 // CPU reference
 // A/B: half
 // C: float
@@ -185,6 +245,47 @@ float benchmark_wmma(
     return ms / repeat;
 }
 
+float benchmark_wmma4warp(
+    const half* d_A,
+    const half* d_B,
+    float* d_C,
+    int M,
+    int N,
+    int K,
+    int warmup,
+    int repeat
+) {
+    dim3 block(32 * WM_BLOCK_WARP);  // 4 warps = 128 threads
+    dim3 grid(N / WM_BLOCK_N, M / WM_BLOCK_M);
+
+    for (int i = 0; i < warmup; i++) {
+        wmma_gemm4warp_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+
+    for (int i = 0; i < repeat; i++) {
+        wmma_gemm4warp_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    }
+
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return ms / repeat;
+}
 // ============================================================
 // cuBLAS FP16 input + FP32 accumulation baseline
 //
@@ -286,6 +387,7 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
     std::vector<half> h_B(size_B);
     std::vector<float> h_C_ref(size_C, 0.0f);
     std::vector<float> h_C_wmma(size_C, 0.0f);
+    std::vector<float> h_C_wmma4warp(size_C, 0.0f);
     std::vector<float> h_C_cublas(size_C, 0.0f);
 
     init_random_half(h_A, 123);
@@ -316,6 +418,9 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
     float ms_wmma = benchmark_wmma(d_A, d_B, d_C, M, N, K, warmup, repeat);
     CHECK_CUDA(cudaMemcpy(h_C_wmma.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
 
+    float ms_wmma4warp = benchmark_wmma4warp(d_A, d_B, d_C, M, N, K, warmup, repeat);
+    CHECK_CUDA(cudaMemcpy(h_C_wmma4warp.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
+
     float ms_cublas = benchmark_cublas(handle, d_A, d_B, d_C, M, N, K, warmup, repeat);
     CHECK_CUDA(cudaMemcpy(h_C_cublas.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -323,6 +428,10 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
 
     std::cout << "wmma minimal : " << ms_wmma
               << " ms, " << calc_gflops(M, N, K, ms_wmma)
+              << " GFLOPS" << std::endl;
+
+    std::cout << "wmma 4warp   : " << ms_wmma4warp
+              << " ms, " << calc_gflops(M, N, K, ms_wmma4warp)
               << " GFLOPS" << std::endl;
 
     std::cout << "cuBLAS hgemm : " << ms_cublas
@@ -334,12 +443,19 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
         double mean_err_wmma = 0.0;
         calc_error(h_C_ref, h_C_wmma, max_err_wmma, mean_err_wmma);
 
+        float max_err_wmma4warp = 0.0f;
+        double mean_err_wmma4warp = 0.0;
+        calc_error(h_C_ref, h_C_wmma4warp, max_err_wmma4warp, mean_err_wmma4warp);
+
         float max_err_cublas = 0.0f;
         double mean_err_cublas = 0.0;
         calc_error(h_C_ref, h_C_cublas, max_err_cublas, mean_err_cublas);
 
         std::cout << "max error wmma      : " << max_err_wmma << std::endl;
         std::cout << "mean error wmma     : " << mean_err_wmma << std::endl;
+
+        std::cout << "max error wmma4warp : " << max_err_wmma4warp << std::endl;
+        std::cout << "mean error wmma4warp: " << mean_err_wmma4warp << std::endl;
 
         std::cout << "max error cuBLAS    : " << max_err_cublas << std::endl;
         std::cout << "mean error cuBLAS   : " << mean_err_cublas << std::endl;
