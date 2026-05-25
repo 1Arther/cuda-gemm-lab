@@ -37,3 +37,12 @@ gemm_lab
 wmma_lab
 main.cu
 build/
+
+# build outputs
+build/
+gemm_lab
+wmma_lab
+
+# benchmark / profiler outputs
+*.txt
+*.ncu-rep

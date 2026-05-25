@@ -394,6 +394,87 @@ __global__ void wmma_gemm16warp_shared_padding_kernel(
     wmma::store_matrix_sync(c_tile, c_frag, N, wmma::mem_row_major);
 }
 
+
+__global__ void wmma_gemm16warp_shared_padding_vec_kernel(
+    const half* A,
+    const half* B,
+    float* C,
+    int M,
+    int N,
+    int K
+) {
+    int tile_col = blockIdx.x;
+    int tile_row = blockIdx.y;
+    int tid=threadIdx.x;
+    int warpId=tid/warpSize;
+    int b_row = tile_row * WM64_BLOCK_M;
+    int b_col = tile_col * WM64_BLOCK_N;
+    int warp_m=warpId/WM64_WARP_N;
+    int warp_n=warpId%WM64_WARP_N;
+    int row=b_row+warp_m*WMMA_M;
+    int col=b_col+warp_n*WMMA_N;
+
+    constexpr int VEC_HALF=8;//一次搬运8个half
+
+    constexpr int A_VEC_PER_ROW=WMMA_K/VEC_HALF;
+    constexpr int A_VEC_TOTAL=WM64_BLOCK_M*A_VEC_PER_ROW; 
+
+    constexpr int B_VEC_PER_ROW=WM64_BLOCK_N/VEC_HALF;
+    constexpr int B_VEC_TOTAL=WMMA_K*B_VEC_PER_ROW;
+
+    __shared__ __align__(16) half AS[WM64_BLOCK_M][WM64_AS_LD];
+    __shared__ __align__(16) half BS[WMMA_K][WM64_BS_LD];
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for(int k0=0;k0<K;k0+=WMMA_K){
+        //A tile
+        for(int vid=threadIdx.x;vid<A_VEC_TOTAL;vid+=blockDim.x){
+            int smem_row=vid/A_VEC_PER_ROW;
+            int vec_col=vid%A_VEC_PER_ROW;
+            int smem_col=vec_col*VEC_HALF;
+
+            const half* gmem_ptr=A+(b_row+smem_row)*K+(k0+smem_col);
+
+            half* smem_ptr=&AS[smem_row][smem_col];
+
+            *reinterpret_cast<uint4*>(smem_ptr)=*reinterpret_cast<const uint4*>(gmem_ptr);
+
+        }
+        //B tile
+        for(int vid=threadIdx.x;vid<B_VEC_TOTAL;vid+=blockDim.x){
+            int smem_row=vid/B_VEC_PER_ROW;
+            int vec_col=vid%B_VEC_PER_ROW;
+            int smem_col=vec_col*VEC_HALF;
+
+            const half* gmem_ptr=B+(k0+smem_row)*N+(b_col+smem_col);
+
+            half* smem_ptr=&BS[smem_row][smem_col];
+
+            *reinterpret_cast<uint4*>(smem_ptr)=*reinterpret_cast<const uint4*>(gmem_ptr);
+        }
+        __syncthreads();
+
+        //warp内分立
+        const half* a_tile=&AS[warp_m*WMMA_M][0];
+        const half* b_tile=&BS[0][warp_n*WMMA_N];
+        //读取要改
+        wmma::load_matrix_sync(a_frag,a_tile,WM64_AS_LD);
+        wmma::load_matrix_sync(b_frag,b_tile,WM64_BS_LD);
+
+        wmma::mma_sync(c_frag,a_frag,b_frag,c_frag);
+
+        __syncthreads();
+    }
+    
+    float* c_tile=C+row*N+col;
+    wmma::store_matrix_sync(c_tile,c_frag,N,wmma::mem_row_major);
+}
+
 // ============================================================
 // CPU reference
 // A/B: half
@@ -666,6 +747,52 @@ float benchmark_wmma16warp_shared_padding(
     return ms / repeat;
 }
 
+float benchmark_wmma16warp_shared_padding_vec(
+    const half* d_A,
+    const half* d_B,
+    float* d_C,
+    int M,
+    int N,
+    int K,
+    int warmup,
+    int repeat
+) {
+    dim3 block(32 * WM64_BLOCK_WARP);  // 16 warps = 512 threads
+    dim3 grid(N / WM64_BLOCK_N, M / WM64_BLOCK_M);
+
+    for (int i = 0; i < warmup; i++) {
+        wmma_gemm16warp_shared_padding_vec_kernel<<<grid, block>>>(
+            d_A, d_B, d_C, M, N, K
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+
+    for (int i = 0; i < repeat; i++) {
+        wmma_gemm16warp_shared_padding_vec_kernel<<<grid, block>>>(
+            d_A, d_B, d_C, M, N, K
+        );
+    }
+
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return ms / repeat;
+}
+
 // ============================================================
 // cuBLAS FP16 input + FP32 accumulation baseline
 //
@@ -771,6 +898,7 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
     std::vector<float> h_C_wmma4warp_shared(size_C, 0.0f);
     std::vector<float> h_C_wmma16warp_shared(size_C, 0.0f);
     std::vector<float> h_C_wmma16warp_padding(size_C, 0.0f);
+    std::vector<float> h_C_wmma16warp_vec(size_C, 0.0f);
     std::vector<float> h_C_cublas(size_C, 0.0f);
 
     init_random_half(h_A, 123);
@@ -813,6 +941,9 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
     float ms_wmma16warp_padding = benchmark_wmma16warp_shared_padding(d_A, d_B, d_C, M, N, K, warmup, repeat);
     CHECK_CUDA(cudaMemcpy(h_C_wmma16warp_padding.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
 
+    float ms_wmma16warp_vec = benchmark_wmma16warp_shared_padding_vec(d_A, d_B, d_C, M, N, K, warmup, repeat);
+    CHECK_CUDA(cudaMemcpy(h_C_wmma16warp_vec.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
+
     float ms_cublas = benchmark_cublas(handle, d_A, d_B, d_C, M, N, K, warmup, repeat);
     CHECK_CUDA(cudaMemcpy(h_C_cublas.data(), d_C, size_C * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -836,6 +967,10 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
 
     std::cout << "wmma 16warp padding: " << ms_wmma16warp_padding
               << " ms, " << calc_gflops(M, N, K, ms_wmma16warp_padding)
+              << " GFLOPS" << std::endl;
+
+    std::cout << "wmma 16warp vec    : " << ms_wmma16warp_vec
+              << " ms, " << calc_gflops(M, N, K, ms_wmma16warp_vec)
               << " GFLOPS" << std::endl;
 
     std::cout << "cuBLAS hgemm : " << ms_cublas
@@ -874,6 +1009,16 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
             mean_err_wmma16warp_padding
         );
 
+        float max_err_wmma16warp_vec = 0.0f;
+        double mean_err_wmma16warp_vec = 0.0;
+
+        calc_error(
+            h_C_ref,
+            h_C_wmma16warp_vec,
+            max_err_wmma16warp_vec,
+            mean_err_wmma16warp_vec
+        );
+
         float max_err_cublas = 0.0f;
         double mean_err_cublas = 0.0;
         calc_error(h_C_ref, h_C_cublas, max_err_cublas, mean_err_cublas);
@@ -895,8 +1040,15 @@ void run_one_shape(int M, int N, int K, bool do_cpu_check) {
         
         std::cout << "max error wmma16warp padding : "
           << max_err_wmma16warp_padding << std::endl;
+
         std::cout << "mean error wmma16warp padding: "
           << mean_err_wmma16warp_padding << std::endl;
+
+        std::cout << "max error wmma16warp vec     : "
+          << max_err_wmma16warp_vec << std::endl;
+
+        std::cout << "mean error wmma16warp vec    : "
+          << mean_err_wmma16warp_vec << std::endl;
 
         std::cout << "max error cuBLAS    : " << max_err_cublas << std::endl;
         std::cout << "mean error cuBLAS   : " << mean_err_cublas << std::endl;

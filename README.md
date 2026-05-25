@@ -551,3 +551,172 @@ double buffering / pipeline
 cp.async
 更复杂的 block-level / warp-level tiling
 
+
+---
+
+## WMMA Vectorized Global-to-Shared Staging
+
+在完成 `16-warp shared WMMA` 和 shared memory padding 优化后，本项目进一步实现了 `uint4` 向量化的 global-to-shared memory 搬运。
+
+### 背景
+
+之前的 shared memory staging 版本中，A/B tile 从 global memory 搬到 shared memory 时使用的是标量 `half` 搬运：
+
+```cpp
+AS[smem_row][smem_col] = A[(block_row + smem_row) * K + (k0 + smem_col)];
+BS[smem_row][smem_col] = B[(k0 + smem_row) * N + (block_col + smem_col)];
+```
+
+这种方式每个线程一次只搬运一个 `half`，指令数量较多。虽然 padding 已经显著降低了 shared-load bank conflict，但 global-to-shared 搬运本身仍然比较低效。
+
+### Vectorized Copy 设计
+
+优化后的版本使用 `uint4` 进行向量化搬运：
+
+```cpp
+*reinterpret_cast<uint4*>(smem_ptr) =
+    *reinterpret_cast<const uint4*>(gmem_ptr);
+```
+
+其中：
+
+```text
+uint4 = 16 bytes = 8 个 half
+```
+
+也就是说，每个线程一次搬运 8 个 `half`，而不是一个 `half`。
+
+对于当前 16-warp WMMA kernel：
+
+```text
+A tile: 64 x 16 half
+B tile: 16 x 64 half
+```
+
+A tile 每行 16 个 half，可以拆成：
+
+```text
+16 / 8 = 2 个 uint4
+```
+
+B tile 每行 64 个 half，可以拆成：
+
+```text
+64 / 8 = 8 个 uint4
+```
+
+因此每个 K tile 中：
+
+```text
+A: 64 x 2 = 128 个 uint4 copy
+B: 16 x 8 = 128 个 uint4 copy
+```
+
+相比标量 half 搬运，向量化版本显著减少了 global load 和 shared store 的指令数量。
+
+### 对齐要求
+
+因为 `uint4` 是 16-byte 向量类型，所以 global memory 和 shared memory 地址都需要满足 16-byte 对齐。
+
+当前默认 padding 为：
+
+```cpp
+#ifndef WM64_PAD_A
+#define WM64_PAD_A 8
+#endif
+
+#ifndef WM64_PAD_B
+#define WM64_PAD_B 8
+#endif
+
+#define WM64_AS_LD (WMMA_K + WM64_PAD_A)        // 24
+#define WM64_BS_LD (WM64_BLOCK_N + WM64_PAD_B)  // 72
+```
+
+对应字节跨度为：
+
+```text
+AS_LD = 24 half = 48 bytes
+BS_LD = 72 half = 144 bytes
+```
+
+二者都满足 16-byte 对齐要求。
+
+### Benchmark 结果
+
+测试平台：NVIDIA A40。
+
+| Shape | WMMA minimal | 16warp shared | 16warp padding | 16warp vectorized | cuBLAS HGEMM |
+|---|---:|---:|---:|---:|---:|
+| 256 x 256 x 256 | 6023.5 GFLOPS | 1515.6 GFLOPS | 1907.3 GFLOPS | 2721.6 GFLOPS | 4147.8 GFLOPS |
+| 512 x 512 x 512 | 13899.5 GFLOPS | 6359.6 GFLOPS | 8100.9 GFLOPS | 11872.5 GFLOPS | 33015.6 GFLOPS |
+| 1024 x 1024 x 1024 | 14833.4 GFLOPS | 8966.8 GFLOPS | 11696.3 GFLOPS | 17979.7 GFLOPS | 82370.5 GFLOPS |
+| 2048 x 2048 x 2048 | 16530.9 GFLOPS | 12091.2 GFLOPS | 15503.5 GFLOPS | 24917.2 GFLOPS | 77492.9 GFLOPS |
+
+以 `2048 x 2048 x 2048` 为例：
+
+```text
+wmma 16warp shared  : 12091.2 GFLOPS
+wmma 16warp padding : 15503.5 GFLOPS
+wmma 16warp vec     : 24917.2 GFLOPS
+cuBLAS hgemm        : 77492.9 GFLOPS
+```
+
+相比 padding 版本，vectorized staging 进一步提升：
+
+```text
+24917.2 / 15503.5 ≈ 1.61x
+```
+
+相比原始 16-warp shared 版本，整体提升：
+
+```text
+24917.2 / 12091.2 ≈ 2.06x
+```
+
+这说明 `uint4` 向量化 global-to-shared staging 是有效优化。
+
+### Nsight Compute 观察
+
+对 `wmma_gemm16warp_shared_padding_vec_kernel` 使用 Nsight Compute 分析后，观察到：
+
+```text
+shared-load bank conflicts: 0
+shared-store bank conflicts: ~4097
+excessive wavefronts: ~4096
+```
+
+相比 padding 版本中仍存在的 shared-load bank conflicts，vectorized 版本基本消除了 shared-load bank conflict，剩余冲突主要来自 vectorized shared store。
+
+同时，Nsight Compute 显示：
+
+```text
+DRAM Throughput: ~3.25%
+L1/TEX Cache Throughput: ~18.14%
+Registers / Thread: 26
+Achieved Occupancy: ~33.38%
+```
+
+这说明当前 kernel 并不是 DRAM 带宽瓶颈，后续性能差距主要来自 Tensor Core pipeline 未被充分喂满、缺少 double buffering / cp.async pipeline、shared memory layout 仍不够成熟等因素。
+
+### 总结
+
+这一阶段的优化链路为：
+
+```text
+16-warp shared WMMA
+-> shared memory padding 降低 bank conflict
+-> uint4 vectorized global-to-shared load 降低搬运指令开销
+```
+
+最终，`2048 x 2048 x 2048` HGEMM 性能从原始 shared 版本的约 `12.1 TFLOPS` 提升到 vectorized 版本的约 `24.9 TFLOPS`。
+
+该结果说明：
+
+```text
+shared memory staging 需要配合合理 layout 和高效搬运方式；
+padding 可以显著降低 bank conflict；
+vectorized global-to-shared load 可以进一步减少搬运开销；
+手写 WMMA kernel 虽然距离 cuBLAS 仍有差距，但已经形成了完整的优化与分析闭环。
+```
+
