@@ -376,3 +376,28 @@ cuBLAS hgemm : 0.0261 ms, 82305.8 GFLOPS
 引入 double buffering / pipeline
 继续对比 cuBLAS Tensor Core baseline
 ```
+
+---
+
+## Multi-warp WMMA Observation
+
+在 minimal WMMA kernel 的基础上，本项目进一步实现了一个 4-warp WMMA 版本：
+
+```text
+一个 block = 4 warps = 128 threads
+一个 block 计算 32 x 32 C tile
+每个 warp 计算一个 16 x 16 C tile
+测试结果显示，4-warp 版本与 minimal WMMA 性能基本持平，甚至略慢。例如在 NVIDIA A40 上：
+
+M=1024, N=1024, K=1024
+wmma minimal : 0.1460 ms, 14710.7 GFLOPS
+wmma 4warp   : 0.1484 ms, 14475.1 GFLOPS
+cuBLAS hgemm : 0.0262 ms, 82048.2 GFLOPS
+
+原因是当前 4-warp 版本虽然引入了 block-level tile 和 warp-level tile 的映射关系，但每个 warp 仍然直接从 global memory 加载自己的 A/B fragment。多个 warp 之间没有通过 shared memory 复用 A/B tile，因此没有真正降低 global memory 访问压力。
+
+这个实验说明：
+
+仅仅增加 block 内 warp 数并不会自动提升 WMMA GEMM 性能；
+multi-warp WMMA 需要结合 shared memory staging 才能产生明显复用收益。
+
