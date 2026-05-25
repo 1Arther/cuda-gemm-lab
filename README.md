@@ -274,3 +274,105 @@ cuda-gemm-lab/
 - RoPE CUDA kernel
 - Linear + activation fusion
 - Triton 版本的常见 LLM kernel
+
+---
+
+## WMMA / Tensor Core GEMM
+
+在完成 FP32 CUDA core GEMM 优化后，本项目进一步实现了一个最小 WMMA GEMM kernel，用于理解 Tensor Core 的基本使用方式。
+
+该版本使用：
+
+```text
+A: FP16, row-major
+B: FP16, row-major
+C: FP32, row-major
+Accumulation: FP32
+```
+
+核心思想是：
+
+```text
+一个 warp 计算一个 16 x 16 的 C tile
+K 方向每次推进 16
+通过 wmma::mma_sync 调用 Tensor Core 完成矩阵乘加
+```
+
+对应的计算形式为：
+
+```text
+C[16, 16] += A[16, 16] x B[16, 16]
+```
+
+### WMMA 核心 API
+
+最小 WMMA kernel 使用了以下 API：
+
+| API | 作用 |
+|---|---|
+| `wmma::fragment` | 定义 warp 级矩阵 tile |
+| `wmma::fill_fragment` | 初始化 accumulator fragment |
+| `wmma::load_matrix_sync` | 从 global memory 加载 A/B tile |
+| `wmma::mma_sync` | 调用 Tensor Core 执行矩阵乘加 |
+| `wmma::store_matrix_sync` | 将 accumulator fragment 写回 global memory |
+
+其中：
+
+```cpp
+wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+```
+
+表示一次执行：
+
+```text
+C[16,16] += A[16,16] x B[16,16]
+```
+
+### WMMA Benchmark
+
+测试平台：NVIDIA A40。
+
+| Shape | WMMA minimal | cuBLAS HGEMM |
+|---|---:|---:|
+| 256 x 256 x 256 | 6023.5 GFLOPS | 4222.7 GFLOPS |
+| 512 x 512 x 512 | 14063.5 GFLOPS | 22103.2 GFLOPS |
+| 1024 x 1024 x 1024 | 14802.0 GFLOPS | 82305.8 GFLOPS |
+| 2048 x 2048 x 2048 | 16684.8 GFLOPS | 77293.0 GFLOPS |
+
+以 `1024 x 1024 x 1024` 为例：
+
+```text
+wmma minimal : 0.1451 ms, 14802.0 GFLOPS
+cuBLAS hgemm : 0.0261 ms, 82305.8 GFLOPS
+```
+
+### 分析
+
+最小 WMMA kernel 已经能够调用 Tensor Core，因此相比手写 FP32 CUDA core GEMM 有一定提升。例如在 `1024 x 1024 x 1024` 上，WMMA minimal 达到约 `14.8 TFLOPS`，高于 FP32 `thread4x4` 版本的约 `10.3 TFLOPS`。
+
+但它和 cuBLAS HGEMM 仍有明显差距，主要原因是当前版本仍然非常基础：
+
+```text
+一个 block 只有一个 warp
+一个 warp 只计算一个 16 x 16 C tile
+没有 block-level tiling
+没有 shared memory staging
+没有多 warp 协作
+没有 double buffering
+没有复杂的 memory layout 优化
+```
+
+因此，当前 WMMA 版本的意义主要是验证 Tensor Core / WMMA API 的基本使用方式，而不是追求最终性能。
+
+下一步优化方向：
+
+```text
+一个 block 使用多个 warp
+一个 block 计算更大的 C tile
+使用 shared memory staging 缓存 A/B tile
+优化 global memory coalescing
+引入 double buffering / pipeline
+继续对比 cuBLAS Tensor Core baseline
+```
